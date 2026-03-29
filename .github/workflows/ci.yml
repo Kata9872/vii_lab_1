@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+    tags: ['*']
+
+# Prevent running duplicate CI workflows in parallel for the same branch/PR
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PRE_COMMIT_HOME: .cache/pre-commit
+  UV_CACHE_DIR: .cache/uv
+  UV_LINK_MODE: symlink
+
+jobs:
+  linters:
+    name: linters (py${{ matrix.python }}, uv${{ matrix.uv }}, ${{ matrix.base }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10']
+        uv: [0.7.3]
+        base: [bookworm]
+
+    container:
+      image: ghcr.io/astral-sh/uv:${{ matrix.uv }}-python${{ matrix.python }}-${{ matrix.base }}
+
+    steps:
+      - name: Install system deps
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          git --version
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Workaround for "fatal: detected dubious ownership" in containerized jobs
+      - name: Mark repo as safe for git
+        shell: bash
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git rev-parse --show-toplevel
+
+      # uv cache: keyed by lock file + matrix parameters
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.UV_CACHE_DIR }}
+          key: uv-${{ runner.os }}-${{ matrix.base }}-py${{ matrix.python }}-uv${{ matrix.uv }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.base }}-py${{ matrix.python }}-uv${{ matrix.uv }}-
+            uv-${{ runner.os }}-${{ matrix.base }}-py${{ matrix.python }}-
+            uv-${{ runner.os }}-
+
+      # pre-commit cache: keyed by .pre-commit-config.yaml + matrix parameters
+      - name: Cache pre-commit
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PRE_COMMIT_HOME }}
+          key: pre-commit-${{ runner.os }}-py${{ matrix.python }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-${{ runner.os }}-py${{ matrix.python }}-
+            pre-commit-${{ runner.os }}-
+
+      - name: Install deps (no project install)
+        shell: bash
+        run: |
+          uv sync --frozen --no-install-project --all-extras --all-groups
+
+      # "Usual way": install pre-commit into the project virtualenv
+      - name: Install pre-commit
+        shell: bash
+        run: |
+          uv pip install --python .venv/bin/python pre-commit
+
+      - name: Run pre-commit
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          uv run pre-commit run --all-files --show-diff-on-failure
+
+      - name: Print pre-commit log on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== pre-commit log (${PRE_COMMIT_HOME}/pre-commit.log) ==="
+          test -f "${PRE_COMMIT_HOME}/pre-commit.log" && cat "${PRE_COMMIT_HOME}/pre-commit.log" || true
+
+      - name: Prune uv cache (ci)
+        if: always()
+        shell: bash
+        run: |
+          uv cache prune --ci
+
+  tests:
+    name: tests (py${{ matrix.python }}, uv${{ matrix.uv }}, ${{ matrix.base }})
+    runs-on: ubuntu-latest
+    needs: [linters]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10']
+        uv: [0.7.3]
+        base: [bookworm]
+
+    container:
+      image: ghcr.io/astral-sh/uv:${{ matrix.uv }}-python${{ matrix.python }}-${{ matrix.base }}
+
+    steps:
+      - name: Install system deps
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          git --version
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same safe.directory workaround (keeps behavior consistent across jobs)
+      - name: Mark repo as safe for git
+        shell: bash
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git rev-parse --show-toplevel
+
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.UV_CACHE_DIR }}
+          key: uv-${{ runner.os }}-${{ matrix.base }}-py${{ matrix.python }}-uv${{ matrix.uv }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.base }}-py${{ matrix.python }}-uv${{ matrix.uv }}-
+            uv-${{ runner.os }}-${{ matrix.base }}-py${{ matrix.python }}-
+            uv-${{ runner.os }}-
+
+      - name: Install deps
+        shell: bash
+        run: |
+          uv sync --frozen
+
+      - name: Run pytest (coverage + junit)
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          uv run pytest \
+            --cov=src \
+            --cov-report term \
+            --cov-report=xml:coverage.xml \
+            --junitxml=report.xml \
+            -v tests
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py${{ matrix.python }}-uv${{ matrix.uv }}
+          path: |
+            report.xml
+            coverage.xml
+
+      - name: Prune uv cache (ci)
+        if: always()
+        shell: bash
+        run: |-
+          uv cache prune --ci
